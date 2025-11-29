@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sakura AR v30.0 Final Fusion</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; font-family: 'Segoe UI', sans-serif; }
+        
+        /* 画布与视频层 */
+        #canvas-container { position: absolute; top: 0; left: 0; width: 100vw; height: 100vh; z-index: 2; }
+        #video-feed { 
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%; 
+            object-fit: cover; transform: scaleX(-1); z-index: 1; 
+            opacity: 1.0; /* 保持原画质 */
+        }
+        
+        /* UI 层 */
+        #ui-layer {
+            position: absolute; top: 20px; left: 0; width: 100%; text-align: center;
+            z-index: 10; color: #f0f; font-weight: bold; text-shadow: 0 0 5px #fff;
+            pointer-events: none; letter-spacing: 2px; font-size: 18px;
+        }
+
+        /* 状态动画 */
+        .status-anim { animation: pop 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275); }
+        @keyframes pop { 0% { transform: scale(1); } 50% { transform: scale(1.5); color: #fff; text-shadow: 0 0 20px #f0f; } 100% { transform: scale(1); } }
+
+        /* 调试/微调面板 */
+        #debug-controls {
+            position: absolute; bottom: 80px; left: 50%; transform: translateX(-50%);
+            z-index: 50; background: rgba(0,0,0,0.6); padding: 10px; border-radius: 10px;
+            display: none; border: 1px solid #f0f; text-align: center;
+        }
+        .dbg-btn {
+            background: #fff; color: #000; border: none; padding: 5px 10px; 
+            margin: 2px; cursor: pointer; font-size: 12px; font-weight: bold;
+        }
+
+        /* 启动按钮 */
+        #start-btn {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            z-index: 50; padding: 15px 40px; font-size: 18px; font-weight: bold;
+            background: rgba(0,0,0,0.6); color: #f0f; border: 2px solid #f0f; 
+            cursor: pointer; box-shadow: 0 0 20px #f0f; 
+            border-radius: 8px; backdrop-filter: blur(5px); transition: all 0.3s;
+        }
+        
+        #loading-bar { position: absolute; top: 60%; width: 100%; text-align: center; color: #fff; display:none; text-shadow: 0 0 4px #000; }
+    </style>
+</head>
+<body>
+
+    <div id="ui-layer">SYSTEM INITIALIZING...</div>
+    <div id="loading-bar">正在加载资源...</div>
+    
+    <div id="debug-controls">
+        <div style="color:#fff; margin-bottom:5px;">大小微调</div>
+        <button class="dbg-btn" onclick="window.adjustModel('scale', 0.1)">放大 (+)</button>
+        <button class="dbg-btn" onclick="window.adjustModel('scale', -0.1)">缩小 (-)</button>
+    </div>
+
+    <button id="start-btn">启动 v30.0 (最终完全版)</button>
+    <video id="video-feed" autoplay muted playsinline></video>
+    <div id="canvas-container"></div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+                "@mediapipe/tasks-vision": "https://unpkg.com/@mediapipe/tasks-vision@0.10.0"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        import { FilesetResolver, GestureRecognizer } from '@mediapipe/tasks-vision';
+
+        // --- 全局变量 ---
+        let scene, camera, renderer, magicCircleGroup;
+        let magicTexture; // 存储魔法阵图片
+
+        let mikuGroup, mikuModel, maomaoGroup, maomaoModel, kleeGroup, kleeModel;
+        let modelTargetPos = new THREE.Vector3(), modelCurrentPos = new THREE.Vector3();
+        let activeCharacter = "NONE"; 
+        
+        let dynamicModelScale = 1.0; 
+        let targetModelScale = 1.0;
+        let baseScaleKlee = 1.0; 
+
+        let audioCtx;
+        let videoElement = document.getElementById('video-feed');
+        let uiLayer = document.getElementById('ui-layer');
+        let loadingBar = document.getElementById('loading-bar');
+        let gestureRecognizer;
+        let isSystemReady = false;
+
+        let targetPos = new THREE.Vector3(0, 0, 0);
+        let currentPos = new THREE.Vector3(0, 0, 0);
+        let targetScale = 1.0; let currentScale = 0; let rotationSpeed = 0;
+        let lockedScale = 1.5; let isSizeLocked = false; let lastToggleTime = 0; 
+        const COOLDOWN_TIME = 10000; 
+        let particleTexture; const activeParticles = [];
+
+        // --- 0. 自动归一化 (让模型大小合适) ---
+        function fitModelToHeight(model, targetHeight) {
+            const box = new THREE.Box3().setFromObject(model);
+            const size = new THREE.Vector3();
+            box.getSize(size);
+            const scaleFactor = targetHeight / size.y;
+            model.scale.set(scaleFactor, scaleFactor, scaleFactor);
+            // 修正中心
+            const center = new THREE.Vector3();
+            box.getCenter(center);
+            model.position.y -= (center.y * scaleFactor); 
+            return scaleFactor; 
+        }
+
+        // --- 1. 音效系统 ---
+        function playSound(type) {
+            if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            if (audioCtx.state === 'suspended') audioCtx.resume();
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            osc.connect(gain); gain.connect(audioCtx.destination);
+            const now = audioCtx.currentTime;
+            
+            if (type === 'summon') { 
+                osc.type = 'sine'; osc.frequency.setValueAtTime(300, now); osc.frequency.exponentialRampToValueAtTime(800, now+0.4);
+                gain.gain.setValueAtTime(0.2, now); gain.gain.exponentialRampToValueAtTime(0.01, now+0.5);
+                osc.start(now); osc.stop(now+0.5);
+            } else if (type === 'lock') { 
+                osc.type = 'triangle'; osc.frequency.setValueAtTime(1200, now);
+                gain.gain.setValueAtTime(0.15, now); gain.gain.exponentialRampToValueAtTime(0.01, now+0.3);
+                osc.start(now); osc.stop(now+0.3);
+            } else if (type === 'dismiss') { 
+                osc.type = 'sine'; osc.frequency.setValueAtTime(600, now); osc.frequency.exponentialRampToValueAtTime(100, now+0.3);
+                gain.gain.setValueAtTime(0.2, now); gain.gain.exponentialRampToValueAtTime(0.01, now+0.3);
+                osc.start(now); osc.stop(now+0.3);
+            }
+        }
+
+        // --- 2. 调试微调 ---
+        window.adjustModel = function(type, val) {
+            let target = null;
+            if (activeCharacter === "MIKU") target = mikuModel;
+            if (activeCharacter === "MAOMAO") target = maomaoModel;
+            if (activeCharacter === "KLEE") target = kleeModel;
+            if (!target) return;
+            if (type === 'scale') { const s = target.scale.x + val; if(s > 0.05) target.scale.set(s, s, s); }
+        };
+
+        // --- 3. 加载资源 (核心) ---
+        function loadResources() {
+            loadingBar.style.display = 'block';
+            const gltfLoader = new GLTFLoader();
+            const texLoader = new THREE.TextureLoader();
+            
+            const BIG_SIZE = 2.0; // Miku 和 猫猫的大小
+            const KLEE_SIZE = 1.2; // Klee 的大小 (稍小)
+
+            // 1. 加载魔法阵图片
+            magicTexture = texLoader.load('./sakura_circle.png', (tex) => {
+                tex.colorSpace = THREE.SRGBColorSpace; 
+                console.log("魔法阵图片加载成功");
+            }, undefined, (err) => {
+                uiLayer.innerText = "❌ 缺少 sakura_circle.png";
+                uiLayer.style.color = "red";
+            });
+
+            // 2. 加载 Miku
+            mikuGroup = new THREE.Group(); scene.add(mikuGroup);
+            gltfLoader.load('./miku_hatsune__wasabi.glb', function (gltf) {
+                mikuModel = gltf.scene; 
+                fitModelToHeight(mikuModel, BIG_SIZE); 
+                mikuModel.position.y = -1.0; 
+                mikuGroup.add(mikuModel); mikuGroup.visible = false; 
+            }, undefined, e => console.error(e));
+
+            // 3. 加载 Maomao
+            maomaoGroup = new THREE.Group(); scene.add(maomaoGroup);
+            gltfLoader.load('./maomao_the_apothecary_diaries.glb', function (gltf) {
+                maomaoModel = gltf.scene; 
+                fitModelToHeight(maomaoModel, BIG_SIZE); 
+                maomaoModel.position.y = -1.0; 
+                maomaoGroup.add(maomaoModel); maomaoGroup.visible = false; 
+            }, undefined, e => console.error(e));
+
+            // 4. 加载 Klee
+            kleeGroup = new THREE.Group(); scene.add(kleeGroup);
+            gltfLoader.load('./klee_genshin_impact.glb', function (gltf) {
+                kleeModel = gltf.scene; 
+                baseScaleKlee = fitModelToHeight(kleeModel, KLEE_SIZE); 
+                kleeModel.position.y = -1.0; 
+                kleeGroup.add(kleeModel); kleeGroup.visible = false; 
+                
+                loadingBar.style.display = 'none';
+                document.getElementById('debug-controls').style.display = 'block';
+            }, undefined, e => console.error(e));
+        }
+
+        // --- 4. 粒子材质 ---
+        function createParticleTexture() {
+            const canvas = document.createElement('canvas'); canvas.width = 32; canvas.height = 32;
+            const ctx = canvas.getContext('2d');
+            const g = ctx.createRadialGradient(16,16,0,16,16,16);
+            g.addColorStop(0, 'rgba(255,255,200,1)'); 
+            g.addColorStop(0.3, 'rgba(255,100,150,1)'); 
+            g.addColorStop(1, 'rgba(0,0,0,0)');
+            ctx.fillStyle = g; ctx.fillRect(0,0,32,32);
+            return new THREE.CanvasTexture(canvas);
+        }
+
+        function initThree() {
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth/window.innerHeight, 0.1, 1000);
+            camera.position.z = 5;
+            
+            // 灯光
+            const ambientLight = new THREE.AmbientLight(0xffffff, 1.2); scene.add(ambientLight);
+            const dirLight = new THREE.DirectionalLight(0xffffff, 2.0); dirLight.position.set(2, 5, 5); scene.add(dirLight);
+
+            // 渲染器 (高清)
+            renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true, powerPreference: "high-performance" });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio); 
+            renderer.outputColorSpace = THREE.SRGBColorSpace; 
+            document.getElementById('canvas-container').appendChild(renderer.domElement);
+
+            // 魔法阵
+            magicCircleGroup = new THREE.Group();
+            const geo = new THREE.PlaneGeometry(6, 6);
+            const mat = new THREE.MeshBasicMaterial({ 
+                map: magicTexture, // 初始可能为空，后续循环会更新
+                transparent: true, 
+                opacity: 0, 
+                side: THREE.DoubleSide, 
+                depthWrite: false 
+            });
+            const circleMesh = new THREE.Mesh(geo, mat);
+            magicCircleGroup.add(circleMesh);
+            scene.add(magicCircleGroup);
+
+            particleTexture = createParticleTexture();
+            loadResources(); 
+            requestAnimationFrame(loop);
+        }
+
+        function spawnParticles(pos, count, speed) {
+            const mat = new THREE.SpriteMaterial({ map: particleTexture, color: 0xffffff, blending: THREE.AdditiveBlending, transparent: true });
+            for(let i=0; i<count; i++) {
+                const sprite = new THREE.Sprite(mat);
+                const angle = Math.random() * Math.PI * 2;
+                const radius = 3.1 * currentScale; const offsetX = Math.cos(angle) * radius; const offsetY = Math.sin(angle) * radius;
+                sprite.position.set(pos.x + offsetX, pos.y + offsetY, 0);
+                const force = speed * 0.4 + 0.1; const baseSize = 0.15 + Math.random() * 0.1; const finalSize = baseSize * currentScale; 
+                sprite.userData = { velocity: new THREE.Vector3(Math.cos(angle)*force, Math.sin(angle)*force, 0), life: 1.0, initialSize: finalSize };
+                sprite.scale.set(finalSize, finalSize, finalSize);
+                scene.add(sprite); activeParticles.push(sprite);
+            }
+        }
+        function updateParticles() {
+             for(let i = activeParticles.length - 1; i >= 0; i--) {
+                const p = activeParticles[i];
+                p.position.add(p.userData.velocity);
+                p.userData.velocity.multiplyScalar(0.96); 
+                p.userData.life -= 0.02; 
+                const currentSize = p.userData.initialSize * (p.userData.life * p.userData.life); 
+                p.scale.set(currentSize, currentSize, currentSize);
+                p.material.opacity = p.userData.life; 
+                if(p.userData.life <= 0) { scene.remove(p); activeParticles.splice(i, 1); }
+            }
+        }
+
+        // --- 核心循环 ---
+        async function loop() {
+            if (gestureRecognizer && videoElement.readyState >= 2) {
+                try {
+                    const results = gestureRecognizer.recognizeForVideo(videoElement, Date.now());
+                    handleGestures(results);
+                } catch (e) { }
+            }
+            updateParticles();
+            
+            // 更新魔法阵贴图 (如果图片加载慢)
+            if (magicCircleGroup && magicTexture && magicCircleGroup.children[0].material.map !== magicTexture) {
+                magicCircleGroup.children[0].material.map = magicTexture;
+                magicCircleGroup.children[0].material.needsUpdate = true;
+            }
+
+            // 法阵动画
+            if (magicCircleGroup) {
+                currentPos.lerp(targetPos, 0.15); magicCircleGroup.position.copy(currentPos);
+                currentScale += (targetScale - currentScale) * 0.1; magicCircleGroup.scale.set(currentScale, currentScale, currentScale);
+                const dist = currentPos.distanceTo(targetPos);
+                if (targetScale > 0.1) {
+                    if (dist > 0.02) { rotationSpeed = dist * 1.5; if (rotationSpeed > 0.1) spawnParticles(currentPos, Math.floor(rotationSpeed*10)+3, rotationSpeed);
+                    } else { rotationSpeed *= 0.9; }
+                    magicCircleGroup.rotation.z -= rotationSpeed;
+                }
+                const targetOpacity = targetScale > 0.1 ? 1 : 0;
+                magicCircleGroup.children[0].material.opacity += (targetOpacity - magicCircleGroup.children[0].material.opacity) * 0.1;
+            }
+            
+            // 角色动画
+            modelCurrentPos.lerp(modelTargetPos, 0.2);
+            dynamicModelScale += (targetModelScale - dynamicModelScale) * 0.1;
+
+            if (mikuGroup) {
+                mikuGroup.position.copy(modelCurrentPos); mikuGroup.visible = (activeCharacter === "MIKU");
+                if (mikuGroup.visible) { mikuGroup.rotation.y += 0.01; mikuGroup.scale.set(2.0, 2.0, 2.0); }
+            }
+            if (maomaoGroup) {
+                maomaoGroup.position.copy(modelCurrentPos); maomaoGroup.visible = (activeCharacter === "MAOMAO");
+                if (maomaoGroup.visible) { maomaoGroup.rotation.y += 0.01; maomaoGroup.scale.set(2.0, 2.0, 2.0); }
+            }
+            if (kleeGroup) {
+                kleeGroup.position.copy(modelCurrentPos); kleeGroup.visible = (activeCharacter === "KLEE");
+                if (kleeGroup.visible && kleeModel) { 
+                    kleeGroup.rotation.y += 0.01; 
+                    const finalS = baseScaleKlee * dynamicModelScale;
+                    kleeModel.scale.set(finalS, finalS, finalS);
+                }
+            }
+
+            renderer.render(scene, camera);
+            requestAnimationFrame(loop);
+        }
+
+        // --- 手势识别逻辑 ---
+        function handleGestures(results) {
+            const hands = results.landmarks; const gestures = results.gestures;
+            let status = "等待指令...";
+            let detectedFist = false; let detectedOpenPalms = 0; let detectedVictory = false; let mainHandIndex = 0;
+
+            if (gestures.length > 0) {
+                for (let i = 0; i < gestures.length; i++) {
+                    const name = gestures[i][0].categoryName;
+                    const score = gestures[i][0].score;
+                    if (score > 0.6) {
+                        if (name === "Closed_Fist") detectedFist = true;
+                        if (name === "Open_Palm") detectedOpenPalms++;
+                        if (name === "Victory") { detectedVictory = true; mainHandIndex = i; }
+                    }
+                }
+            }
+            const now = Date.now(); const cooldownRemaining = Math.ceil((COOLDOWN_TIME - (now - lastToggleTime)) / 1000); const isCoolingDown = cooldownRemaining > 0;
+
+            // 1. 握拳 -> 消失
+            if (detectedFist) {
+                if (activeCharacter !== "NONE") playSound('dismiss');
+                status = "🤜 握拳隐身"; targetScale = 0; activeCharacter = "NONE";
+            }
+            // 2. 比耶 -> Miku
+            else if (detectedVictory) {
+                if (activeCharacter !== "MIKU") playSound('summon');
+                status = "✌️ Miku 降临"; activeCharacter = "MIKU"; targetScale = 0; 
+                const h = hands[mainHandIndex]; const cx = (h[5].x + h[9].x) / 2; const cy = (h[5].y + h[9].y) / 2;
+                modelTargetPos.set(-((cx - 0.5) * 16), -((cy - 0.5) * 9), 0);
+            }
+            // 3. 双手逻辑
+            else if (hands.length === 2) {
+                const h1 = hands[0]; const h2 = hands[1];
+                const yDiff = Math.abs(h1[0].y - h2[0].y);
+                const xDiff = Math.abs(h1[0].x - h2[0].x);
+                
+                // 3a. 上下平行 -> Klee (动态大小)
+                if (yDiff > xDiff * 0.8) {
+                    if (activeCharacter !== "KLEE") playSound('summon');
+                    activeCharacter = "KLEE"; targetScale = 0;
+                    const midX = (h1[0].x + h2[0].x) / 2; const midY = (h1[0].y + h2[0].y) / 2;
+                    modelTargetPos.set(-((midX - 0.5) * 16), -((midY - 0.5) * 9), 0);
+                    targetModelScale = Math.max(0.8, yDiff * 4.0);
+                    status = `🤲 可莉 Klee (Dyn: ${targetModelScale.toFixed(1)})`;
+                }
+                // 3b. 双手张开 -> 锁定/解锁
+                else if (detectedOpenPalms === 2) {
+                    activeCharacter = "NONE";
+                    if (!isCoolingDown) { 
+                        isSizeLocked = !isSizeLocked; lastToggleTime = now; 
+                        playSound('lock'); if (isSizeLocked) { lockedScale = targetScale; triggerUIAnim(); } else { triggerUIAnim(); } 
+                    }
+                    status = isSizeLocked ? (isCoolingDown ? `🔒 已锁定 (${cooldownRemaining}s)` : "🔒 已锁定") : (isCoolingDown ? `🔓 已解锁 (${cooldownRemaining}s)` : "🔓 已解锁");
+                }
+                // 3c. 调整大小
+                else if (!isSizeLocked) {
+                    activeCharacter = "NONE"; status = "↔️ 法阵大小调整";
+                    const dist = Math.sqrt((h1[8].x - h2[8].x)**2 + (h1[8].y - h2[8].y)**2);
+                    targetScale = Math.max(0.3, dist * 6.0); lockedScale = targetScale; 
+                }
+            }
+            // 4. 单手托举 -> Maomao
+            else if (hands.length === 1 && detectedOpenPalms === 1) {
+                if (activeCharacter !== "MAOMAO") playSound('summon');
+                status = "✋ 托举猫猫"; activeCharacter = "MAOMAO"; targetScale = 0; 
+                const h = hands[0]; const cx = (h[0].x + h[5].x + h[17].x) / 3; const cy = (h[0].y + h[5].y + h[17].y) / 3;
+                modelTargetPos.set(-((cx - 0.5) * 16), -((cy - 0.5) * 9), 0);
+            }
+            // 5. 单手操控 (默认)
+            else if (hands.length === 1) {
+                activeCharacter = "NONE"; status = "✨ 法阵操控"; targetScale = (lockedScale > 0.1) ? lockedScale : 1.0;
+                const h = hands[0]; const cx = (h[8].x + h[12].x) / 2; const cy = (h[8].y + h[12].y) / 2;
+                targetPos.set(-((cx - 0.5) * 16), -((cy - 0.5) * 9), 0);
+            }
+            else { activeCharacter = "NONE"; }
+            uiLayer.innerText = status;
+        }
+
+        function triggerUIAnim() { uiLayer.classList.remove('status-anim'); void uiLayer.offsetWidth; uiLayer.classList.add('status-anim'); }
+
+        async function startVision() {
+            const vision = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm");
+            gestureRecognizer = await GestureRecognizer.createFromOptions(vision, { baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task", delegate: "GPU" }, runningMode: "VIDEO", numHands: 2 });
+            isSystemReady = true; document.getElementById('start-btn').innerText = "点击启动 (请允许摄像头)";
+        }
+
+        document.getElementById('start-btn').addEventListener('click', async () => {
+            if(!isSystemReady) return; document.getElementById('start-btn').style.display = 'none';
+            if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720 } }); videoElement.srcObject = stream; initThree();
+        });
+        startVision();
+    </script>
+</body>
+</html>
