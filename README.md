@@ -1,6 +1,5 @@
 # 🌸 Sakura AR: Hand Gesture Summoning System
 
-[中文说明](#中文说明) | [English Description](#english-description)
 
 ## 📖 English Description
 
