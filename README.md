@@ -2,9 +2,6 @@
 
 [中文说明](#中文说明) | [English Description](#english-description)
 
-![Project Banner](https://via.placeholder.com/1000x300?text=Sakura+AR+System+v30.0)
-*(建议上传一张运行截图替换上方链接 / You can replace this link with a screenshot)*
-
 ## 📖 English Description
 
 **Sakura AR** is a browser-based Augmented Reality (WebAR) experiment that allows users to summon 3D characters and magic circles using specific hand gestures. Built with **Three.js** and **Google MediaPipe**, it runs entirely in the browser without requiring any app installation.
